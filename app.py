@@ -6,6 +6,7 @@ ATUSU 录屏 - 主界面
   * 全屏 / 自定义区域录制，区域外框以红色实线常显
   * 录制时主界面自动最小化到任务栏，右侧出现圆形录制控件（暂停 / 继续 / 结束）
   * 录制完成后自动还原主界面并生成录屏记录
+  * F9 / F10 为系统级热键：程序在后台或最小化时依然可用
   * 单实例运行：重复启动只会把已打开的窗口还原到前台
 """
 
@@ -24,6 +25,7 @@ from tkinter import ttk, filedialog, messagebox
 import engine as E
 import overlayui as O
 import floatwin as Fw
+import hotkeys as H
 
 
 class _POINT(ctypes.Structure):
@@ -1184,8 +1186,8 @@ class AboutDialog(object):
             tk.Label(pad, text=t, bg=CARD, fg=TEXT, font=(f, 9),
                      anchor="w", justify="left").pack(fill="x", pady=1)
 
-        tip_txt = ("提示：主界面可按 F9 开始 / 结束，F10 暂停 / 继续；圆形控件可拖动位置；"
-                   "重复双击程序不会开出第二个窗口，只会把已打开的界面还原到前台。")
+        tip_txt = ("提示：程序在后台或最小化时，F9 开始 / 结束、F10 暂停 / 继续同样有效；"
+                   "圆形控件可拖动位置；重复双击程序不会开出第二个窗口，只会把已打开的界面还原到前台。")
         if E.IS_PACKED_FFMPEG:
             tip_txt += "\n本版已内置 ffmpeg，可直接输出 MP4，无需安装任何外部程序。"
         elif E.IS_SINGLE_FILE:
@@ -1256,6 +1258,7 @@ class App(object):
         self._families = set(tkfont.families())
         self.region = tuple(self.settings.get("region") or ())
         self._stopping = False
+        self._hotkey_busy = False
         self._blink = False
         self._status_job = None
         self._status_raw = ""
@@ -1283,8 +1286,9 @@ class App(object):
         self._refresh_frame()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
-        root.bind("<F9>", lambda e: self._hotkey_start_stop())
-        root.bind("<F10>", lambda e: self._hotkey_pause_resume())
+        # F9 / F10 注册为系统级热键：主界面最小化或切到后台后依旧有效。
+        # 事件由 hotkeys 模块转回 Tk 主线程，这里收到的回调可以安全操作界面。
+        self.hotkeys = H.GlobalHotkeys(root, self._on_hotkey).start()
         self.root.after(150, self._tick)
 
     # ------------------------------------------------------------ 基础
@@ -1580,7 +1584,7 @@ class App(object):
         tk.Label(bar, text="© 2026 %s　保留所有权利" % E.APP_PUBLISHER,
                  bg=CARD, fg=MUTED, font=(self.font, 9)).pack(side="right")
         self._dot(bar).pack(side="right", padx=9)
-        tk.Label(bar, text="F9 开始/结束　F10 暂停/继续", bg=CARD,
+        tk.Label(bar, text="F9 开始/结束　F10 暂停/继续（全局）", bg=CARD,
                  fg="#9AA3AF", font=(self.font, 9)).pack(side="right",
                                                          padx=(0, 16))
 
@@ -1865,6 +1869,25 @@ class App(object):
         self._sync_state()
         self._refresh_frame()
 
+    def _on_hotkey(self, action):
+        """全局热键回调（Tk 主线程）：录制控制不允许重入。"""
+        if self._hotkey_busy:
+            return
+        # 正在选择录制区域时主窗口是 withdraw 状态，此时按热键会打乱选区流程
+        try:
+            if self.root.state() == "withdrawn":
+                return
+        except Exception:
+            pass
+        self._hotkey_busy = True
+        try:
+            if action == H.ACTION_START_STOP:
+                self._hotkey_start_stop()
+            elif action == H.ACTION_PAUSE_RESUME:
+                self._hotkey_pause_resume()
+        finally:
+            self._hotkey_busy = False
+
     def _hotkey_start_stop(self):
         if self.recorder.is_active:
             self._stop()
@@ -2104,6 +2127,10 @@ class App(object):
             self.recorder.stop()
         try:
             self.floating.hide()
+        except Exception:
+            pass
+        try:
+            self.hotkeys.close()
         except Exception:
             pass
         try:
