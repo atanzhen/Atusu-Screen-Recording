@@ -7,6 +7,7 @@ atusu 录屏 - 采集与编码引擎
   * MP4(H.264) 通过 ffmpeg 管道实时编码
   * AVI(MJPG) 内置封装器，无需任何外部程序
   * GIF 动图收集器
+  * 可选的系统声音（WASAPI 环回）：MP4 写入 AAC、AVI 写入 PCM
 """
 
 import os
@@ -20,6 +21,8 @@ import subprocess
 import datetime
 
 from PIL import Image
+
+import audiocap
 
 APP_NAME = "ATUSU 录屏"
 APP_VERSION = "1.3.3"
@@ -764,6 +767,50 @@ def resolve_format(fmt):
     return fmt
 
 
+def _sidecar_path(path, tag):
+    """在最终文件旁边生成临时文件路径：xxx_video.mp4 / xxx_audio.wav。"""
+    base, ext = os.path.splitext(path)
+    return "%s_%s%s" % (base, tag, ext)
+
+
+def mux_audio(video_path, audio_path, out_path, fmt, lead=0.0):
+    """把 WAV 与视频合并成最终文件（MP4 = AAC，AVI = PCM）。
+
+    ``lead`` 是音频比视频多出来的开头时长，合并时从音频开头裁掉，
+    让声音与画面从同一时刻开始。
+    """
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("未找到 ffmpeg，无法合并系统声音")
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+    if lead and lead > 0.001:
+        cmd += ["-ss", "%.3f" % lead]
+    cmd += ["-i", audio_path, "-i", video_path,
+            "-map", "1:v:0", "-map", "0:a:0", "-c:v", "copy"]
+    if fmt == "MP4":
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                "-movflags", "+faststart"]
+    else:
+        cmd += ["-c:a", "pcm_s16le", "-ac", "2"]
+    cmd += ["-shortest", out_path]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            creationflags=CREATE_NO_WINDOW)
+    try:
+        _, err = proc.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise RuntimeError("声音合并超时")
+    if (proc.returncode != 0 or not os.path.isfile(out_path)
+            or os.path.getsize(out_path) < 1024):
+        msg = (err or b"").decode("utf-8", "ignore")[-400:]
+        raise RuntimeError("声音合并失败：%s" % (msg or "ffmpeg 未输出文件"))
+    return out_path
+
+
 class Recorder(object):
     """录制控制器：开始 / 暂停 / 继续 / 停止。"""
 
@@ -787,6 +834,14 @@ class Recorder(object):
         self._paused_at = 0.0
         self._paused_total = 0.0
         self.effective_fmt = "MP4"
+        # 系统声音（WASAPI 环回）
+        self.audio_requested = False
+        self.audio_active = False
+        self.audio_error = ""
+        self._audio = None
+        self._audio_path = ""
+        self._video_path = ""
+        self._video_started_at = 0.0
 
     # -- 状态查询 ----------------------------------------------------
     @property
@@ -804,7 +859,7 @@ class Recorder(object):
         return self.frame_count / float(max(1, self.fps))
 
     # -- 生命周期 ----------------------------------------------------
-    def start(self, region, out_size, fps, fmt, path):
+    def start(self, region, out_size, fps, fmt, path, audio=False):
         if self.is_active:
             raise RuntimeError("正在录制中")
         self.region = tuple(int(v) for v in region)
@@ -818,28 +873,92 @@ class Recorder(object):
         self._paused_total = 0.0
         self._paused_at = 0.0
         self._start_ts = time.time()
+        self.audio_requested = bool(audio)
+        self.audio_active = False
+        self.audio_error = ""
+        self._audio = None
+        self._audio_path = ""
+        self._video_path = path
+        self._video_started_at = 0.0
 
         use_fmt = resolve_format(fmt)
         self.effective_fmt = use_fmt
 
+        # 声音只对有音频轨道的格式生效；AVI 需要 ffmpeg 才能把 WAV 合并进去。
+        if self.audio_requested and use_fmt == "GIF":
+            self.audio_requested = False
+            self.audio_error = "GIF 格式不支持声音"
+        if self.audio_requested and use_fmt == "AVI" and not find_ffmpeg():
+            self.audio_requested = False
+            self.audio_error = "录制系统声音需要 ffmpeg，本次仅录制视频"
+
+        use_audio = self.audio_requested
+        if use_audio:
+            # 视频先写到临时文件，停止后再与 WAV 合并到最终路径。
+            self._video_path = _sidecar_path(path, "video")
+            self._audio_path = os.path.splitext(path)[0] + "_audio.wav"
+
         w, h = self.out_size
-        if use_fmt == "MP4":
-            self.writer = FfmpegWriter(path, w, h, self.fps)
-        elif use_fmt == "AVI":
-            self.writer = AviWriter(path, w, h, self.fps)
-        else:
-            self.writer = GifWriter(path, w, h, self.fps)
+        try:
+            if use_fmt == "MP4":
+                self.writer = FfmpegWriter(self._video_path, w, h, self.fps)
+            elif use_fmt == "AVI":
+                self.writer = AviWriter(self._video_path, w, h, self.fps)
+            else:
+                self.writer = GifWriter(self._video_path, w, h, self.fps)
+        except Exception:
+            self.writer = None
+            self._remove_file(self._video_path)
+            raise
+
+        # 视频编码器就绪后再启动声音采集：WASAPI 初始化通常比 ffmpeg 启动快，
+        # 这样声音比画面早开始的时间很短，合并时再按实际时间差裁掉开头。
+        if use_audio:
+            capture = audiocap.SystemAudioCapture(self._audio_path)
+            try:
+                capture.start()
+                self._audio = capture
+                self.audio_active = True
+            except Exception as e:
+                try:
+                    capture.stop()
+                except Exception:
+                    pass
+                self._audio = None
+                self.audio_active = False
+                self.audio_error = "系统声音不可用：%s" % e
 
         self._grabber = None
         self._running = True
         self.state = STATE_RECORDING
         self._thread = threading.Thread(target=self._loop, name="recorder")
         self._thread.daemon = True
-        self._thread.start()
+        try:
+            self._thread.start()
+        except Exception:
+            self._running = False
+            self.state = STATE_IDLE
+            if self._audio is not None:
+                try:
+                    self._audio.stop()
+                except Exception:
+                    pass
+                self._audio = None
+            if self.writer is not None:
+                try:
+                    self.writer.close()
+                except Exception:
+                    pass
+                self.writer = None
+            self._remove_file(self._audio_path)
+            self._remove_file(self._video_path)
+            raise
 
     def pause(self):
         if self.state == STATE_RECORDING:
             self._paused_at = time.time()
+            if self._audio is not None:
+                self._audio.pause()
             self.state = STATE_PAUSED
 
     def resume(self):
@@ -847,25 +966,66 @@ class Recorder(object):
             self._paused_total += time.time() - self._paused_at
             self._paused_at = 0.0
             self.state = STATE_RECORDING
+            if self._audio is not None:
+                self._audio.resume()
 
     def stop(self):
         if not self.is_active:
             return None
         self._running = False
         self.state = STATE_IDLE
+        audio = self._audio
+        if audio is not None:
+            try:
+                audio.stop()
+            except Exception as e:
+                self.audio_error = self.audio_error or ("停止系统声音失败：%s" % e)
         if self._thread:
             self._thread.join(timeout=8.0)
         self._thread = None
+        if audio is not None and audio.error:
+            self.audio_error = self.audio_error or audio.error
         info = None
         err = ""
         duration = self.video_duration()
+        final_path = ""
+        audio_included = False
         try:
             if self.writer:
                 if self.effective_fmt == "GIF":
                     duration = float(self.writer.frames) / float(
                         max(1, self.writer.fps))
-                final_path = self.writer.close()
+                video_path = self.writer.close() or self._video_path
+                if audio is not None and audio.thread_alive:
+                    self.audio_error = self.audio_error or (
+                        "系统声音采集未能及时停止，本次仅保存视频")
+                if (audio is not None and audio.frames > 0
+                        and os.path.isfile(self._audio_path)
+                        and not audio.thread_alive):
+                    lead = 0.0
+                    if audio.started_at and self._video_started_at:
+                        lead = max(0.0,
+                                   self._video_started_at - audio.started_at)
+                        lead = min(lead, max(0.0, audio.duration - 0.05))
+                    try:
+                        mux_audio(video_path, self._audio_path, self.path,
+                                  self.effective_fmt, lead)
+                        audio_included = True
+                        final_path = self.path
+                        self._remove_file(video_path)
+                    except Exception as e:
+                        self.audio_error = "系统声音合并失败：%s" % e
+                        final_path = self._finish_video(video_path)
+                else:
+                    final_path = self._finish_video(video_path)
+                    if (audio is not None and not self.audio_error
+                            and audio.frames <= 0):
+                        self.audio_error = "没有采集到系统声音"
                 info = self._build_info(final_path, duration)
+                if audio_included:
+                    info["audio"] = True
+                if self.audio_error:
+                    info["audio_error"] = self.audio_error
         except Exception as e:
             err = str(e)
         finally:
@@ -873,8 +1033,47 @@ class Recorder(object):
             if self._grabber:
                 self._grabber.close()
                 self._grabber = None
+            if audio is not None:
+                try:
+                    audio.stop()
+                except Exception:
+                    pass
+            self._audio = None
+            self.audio_active = False
+            # 清掉没有被采用的临时文件；最终文件本身不能删。
+            for p in (self._audio_path, self._video_path):
+                if p and os.path.abspath(p) != os.path.abspath(final_path):
+                    self._remove_file(p)
+            self._audio_path = ""
+            self._video_path = ""
         self.error = err
         return info
+
+    @staticmethod
+    def _remove_file(path):
+        try:
+            if path and os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def _finish_video(self, video_path):
+        """把临时视频文件落到最终路径；改名失败时退回复制。"""
+        if not video_path:
+            return self.path
+        if os.path.abspath(video_path) == os.path.abspath(self.path):
+            return self.path
+        self._remove_file(self.path)
+        try:
+            os.replace(video_path, self.path)
+            return self.path
+        except OSError:
+            try:
+                shutil.copyfile(video_path, self.path)
+                self._remove_file(video_path)
+                return self.path
+            except OSError:
+                return video_path
 
     # -- 采集线程 ----------------------------------------------------
     def _loop(self):
@@ -884,12 +1083,18 @@ class Recorder(object):
         out_w, out_h = self.out_size
         try:
             self._grabber = make_grabber()
+            first_frame = True
             while self._running:
                 if self.state == STATE_PAUSED:
                     time.sleep(0.03)
                     next_t = time.perf_counter()
                     continue
                 img = self._grabber.grab(x, y, w, h, cursor=self.capture_cursor)
+                if first_frame:
+                    # 以第一帧真正抓取的时刻作为视频时间轴起点，
+                    # 合并时按它裁掉音频开头，音画从同一时刻开始。
+                    self._video_started_at = time.perf_counter()
+                    first_frame = False
                 if img.size != (out_w, out_h):
                     img = img.resize((out_w, out_h), Image.BILINEAR)
                 self.writer.add_image(img)
