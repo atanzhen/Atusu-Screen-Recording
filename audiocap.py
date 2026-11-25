@@ -7,9 +7,9 @@
 * 通过 COM 调用 WASAPI：``IMMDeviceEnumerator`` → 默认播放设备 →
   ``IAudioClient`` → ``IAudioCaptureClient``，并打开
   ``AUDCLNT_STREAMFLAGS_LOOPBACK`` 环回流。
-* 优先请求 48 kHz / 双声道 / 16-bit PCM，并打开
-  ``AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM``，让 Windows 自己完成重采样与下混；
-  若设备不接受，再退回设备自己的混音格式并转成双声道 16-bit WAV。
+* 使用设备自己的混音格式（``GetMixFormat``）打开环回流，WAV 头也写入设备
+  实际的采样率。不要再强行改成 48 kHz：某些设备实际以 44.1 kHz 输出，
+  若仍把 WAV 标成 48 kHz，声音就会快约 8.8%，越录越不同步。
 * 采集线程只做「取数据 → 写 WAV」，暂停时继续排空设备缓冲但不写入，
   因此 WAV 的时长与视频的有效录制时长一致。
 * 录制结束后由 ``engine`` 用 ffmpeg 把 WAV 与视频合并。
@@ -45,8 +45,6 @@ _E_COMMUNICATIONS = 2
 
 _SHARED = 0
 _LOOPBACK = 0x00020000
-_AUTOCONVERT = 0x80000000
-_SRC_DEFAULT = 0x08000000
 _BUFFER_DURATION = 2_000_000         # 200 ms（100ns 单位）
 
 _WAVE_FORMAT_PCM = 1
@@ -80,6 +78,26 @@ ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
 ole32.CoCreateInstance.restype = ctypes.HRESULT
 ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
 ole32.CoTaskMemFree.restype = None
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.QueryPerformanceCounter.argtypes = [ctypes.POINTER(ctypes.c_longlong)]
+kernel32.QueryPerformanceCounter.restype = wintypes.BOOL
+kernel32.QueryPerformanceFrequency.argtypes = [ctypes.POINTER(ctypes.c_longlong)]
+kernel32.QueryPerformanceFrequency.restype = wintypes.BOOL
+
+
+def _qpc_now():
+    """当前 QPC 时间（秒）。包时间戳也是 QPC，但固定按 100ns 换算。"""
+    counter = ctypes.c_longlong()
+    freq = ctypes.c_longlong()
+    try:
+        if (kernel32.QueryPerformanceCounter(ctypes.byref(counter))
+                and kernel32.QueryPerformanceFrequency(ctypes.byref(freq))
+                and freq.value):
+            return float(counter.value) / float(freq.value)
+    except Exception:
+        pass
+    return 0.0
 
 
 class _GUID(ctypes.Structure):
@@ -227,42 +245,28 @@ def _open_session():
     device = client = capture = None
     try:
         device = _default_render_device(enumerator)
-
-        # 先尝试让 Windows 自动转换成固定的 48 kHz / 双声道 / 16-bit，
-        # 这样采集端只需要原样写字节，CPU 占用最低。
         client = _activate_client(device)
-        target = _WaveFormatEx(_WAVE_FORMAT_PCM, TARGET_CHANNELS, TARGET_RATE,
-                               TARGET_RATE * TARGET_BLOCK, TARGET_BLOCK,
-                               16, 0)
-        hr = _method(client, 3, ctypes.c_int, wintypes.DWORD,
-                     ctypes.c_longlong, ctypes.c_longlong,
-                     ctypes.POINTER(_WaveFormatEx), ctypes.c_void_p)(
-            client, _SHARED, _LOOPBACK | _AUTOCONVERT | _SRC_DEFAULT,
-            _BUFFER_DURATION, 0, ctypes.byref(target), None)
-        if hr >= 0:
-            info = _StreamInfo("s16", TARGET_CHANNELS, TARGET_RATE,
-                               TARGET_BLOCK, 0, True)
-        else:
-            # 设备不接受自动转换：重新拿一个 client，用设备自己的混音格式。
-            _release(client)
-            client = None
-            client = _activate_client(device)
-            mix = ctypes.POINTER(_WaveFormatEx)()
-            hr = _method(client, 8,
-                         ctypes.POINTER(ctypes.POINTER(_WaveFormatEx)))(
-                client, ctypes.byref(mix))
-            _check(hr, "无法读取音频设备格式")
-            try:
-                kind, channels, rate, block, mask = _parse_mix_format(mix)
-                hr = _method(client, 3, ctypes.c_int, wintypes.DWORD,
-                             ctypes.c_longlong, ctypes.c_longlong,
-                             ctypes.POINTER(_WaveFormatEx), ctypes.c_void_p)(
-                    client, _SHARED, _LOOPBACK, _BUFFER_DURATION, 0,
-                    mix, None)
-                _check(hr, "无法打开系统声音环回流")
-            finally:
-                ole32.CoTaskMemFree(mix)
-            info = _StreamInfo(kind, channels, rate, block, mask, False)
+
+        # 一定要用设备自己的混音格式：共享模式环回流本来就会按这个格式
+        # 交付数据。若强行请求 48 kHz 而设备实际是 44.1 kHz，某些声卡 /
+        # 虚拟声卡会照旧交付 44.1 kHz 数据，但 WAV 头写成 48 kHz，声音
+        # 就会快 8.8%，录制时间越长音画偏差越大。
+        mix = ctypes.POINTER(_WaveFormatEx)()
+        hr = _method(client, 8,
+                     ctypes.POINTER(ctypes.POINTER(_WaveFormatEx)))(
+            client, ctypes.byref(mix))
+        _check(hr, "无法读取音频设备格式")
+        try:
+            kind, channels, rate, block, mask = _parse_mix_format(mix)
+            hr = _method(client, 3, ctypes.c_int, wintypes.DWORD,
+                         ctypes.c_longlong, ctypes.c_longlong,
+                         ctypes.POINTER(_WaveFormatEx), ctypes.c_void_p)(
+                client, _SHARED, _LOOPBACK, _BUFFER_DURATION, 0,
+                mix, None)
+            _check(hr, "无法打开系统声音环回流")
+        finally:
+            ole32.CoTaskMemFree(mix)
+        info = _StreamInfo(kind, channels, rate, block, mask, False)
 
         capture = ctypes.c_void_p()
         hr = _method(client, 14, ctypes.POINTER(_GUID), _VOIDPP)(
@@ -409,6 +413,9 @@ def _to_stereo_pcm16(raw, info):
 class SystemAudioCapture(object):
     """在后台线程里录制扬声器输出，写入一个双声道 16-bit WAV。"""
 
+    IDLE_MARGIN = 0.5
+    IDLE_STEP = 0.02
+
     def __init__(self, path):
         self.path = path
         self.rate = TARGET_RATE
@@ -420,6 +427,9 @@ class SystemAudioCapture(object):
         self._stop = threading.Event()
         self._paused = False
         self._wav = None
+        self._start_qpc = 0.0
+        self._last_qpc_end = 0.0
+        self._last_pos_end = -1
 
     # -- 控制 --------------------------------------------------------
     def start(self, timeout=5.0):
@@ -440,6 +450,10 @@ class SystemAudioCapture(object):
 
     def pause(self):
         self._paused = True
+        # 暂停期间的时间不能补静音，继续时重新对齐时间轴。
+        self._start_qpc = 0.0
+        self._last_qpc_end = 0.0
+        self._last_pos_end = -1
 
     def resume(self):
         self._paused = False
@@ -482,8 +496,15 @@ class SystemAudioCapture(object):
             _check(_method(client, 10)(client), "无法启动系统声音采集")
             started = True
             self.started_at = time.perf_counter()
+            self._start_qpc = _qpc_now()
             self._ready.set()
             self._pump(capture, info)
+            # 停止时把最后一段尚未补上的静音补齐（暂停时不能补）。
+            if not self._paused:
+                end = _qpc_now()
+                start = self._last_qpc_end or self._start_qpc
+                if end and start and end > start:
+                    self._write_silence(round((end - start) * self.rate))
         except Exception as exc:
             self.error = str(exc) or exc.__class__.__name__
         finally:
@@ -509,6 +530,67 @@ class SystemAudioCapture(object):
                 except Exception:
                     pass
 
+    def _write_silence(self, frames):
+        """向 WAV 写入指定帧数的双侧静音。"""
+        frames = int(frames)
+        if frames <= 0 or self._wav is None:
+            return
+        frames = min(frames, int(self.rate * 600))   # 单段最多补 10 分钟
+        chunk = max(1, min(int(self.rate), frames))
+        zeros = b"\x00" * (chunk * TARGET_BLOCK)
+        while frames > 0:
+            n = min(frames, chunk)
+            self._wav.writeframesraw(zeros[:n * TARGET_BLOCK])
+            self.frames += n
+            frames -= n
+
+    def _fill_timeline(self, qpc, pos, count):
+        """按设备时间戳补上缺失的静音。
+
+        某些声卡在系统没有播放声音时不会投递环回包；如果直接拼接，
+        WAV 会少掉这些静音段，表现为声音越来越快、音画不同步。这里用
+        ``GetBuffer`` 返回的 QPC 时间 / 设备位置把空档补成静音。
+        """
+        qpc_sec = qpc / 10000000.0 if qpc else 0.0
+        if qpc_sec:
+            if self._last_qpc_end:
+                gap = qpc_sec - self._last_qpc_end
+                if gap > 0:
+                    self._write_silence(round(gap * self.rate))
+            elif self._start_qpc and qpc_sec > self._start_qpc:
+                self._write_silence(
+                    round((qpc_sec - self._start_qpc) * self.rate))
+            self._last_qpc_end = qpc_sec + count / float(self.rate)
+            self._last_pos_end = pos + count if pos else -1
+            return
+        if pos:
+            if self._last_pos_end >= 0 and pos > self._last_pos_end:
+                self._write_silence(pos - self._last_pos_end)
+            self._last_pos_end = pos + count
+
+    def _fill_idle_silence(self):
+        """设备长时间没有投递数据时，主动按时间补静音。
+
+        WASAPI 环回在系统完全静音时可能完全不产生 packet；只在收到下一个
+        packet 时补空档还不够，因为最后一段静音可能永远不会补上。这里在
+        轮询空闲时按 QPC 时间把已经过去的空档写成静音，并留出 500ms 余量
+        防止和正常延迟到达的 packet 重叠。
+        """
+        if self._paused:
+            return
+        now = _qpc_now()
+        if not now:
+            return
+        end = self._last_qpc_end or self._start_qpc
+        if not end:
+            return
+        gap = now - end - self.IDLE_MARGIN
+        if gap >= self.IDLE_STEP:
+            frames = int(round(gap * self.rate))
+            if frames > 0:
+                self._write_silence(frames)
+                self._last_qpc_end = end + frames / float(self.rate)
+
     def _pump(self, capture, info):
         get_next = _method(capture, 5, ctypes.POINTER(wintypes.UINT))
         get_buffer = _method(capture, 3,
@@ -525,20 +607,25 @@ class SystemAudioCapture(object):
             if hr < 0:
                 raise AudioUnavailable("读取系统声音失败（%s）" % _hr_text(hr))
             if waiting.value == 0:
+                self._fill_idle_silence()
                 self._stop.wait(0.01)
                 continue
             while waiting.value > 0 and not self._stop.is_set():
                 data = ctypes.POINTER(ctypes.c_ubyte)()
                 frames = wintypes.UINT(0)
                 flags = wintypes.DWORD(0)
+                pos = ctypes.c_ulonglong(0)
+                qpc = ctypes.c_ulonglong(0)
                 hr = get_buffer(capture, ctypes.byref(data),
                                 ctypes.byref(frames), ctypes.byref(flags),
-                                None, None)
+                                ctypes.byref(pos), ctypes.byref(qpc))
                 if hr < 0:
                     raise AudioUnavailable("读取系统声音失败（%s）" % _hr_text(hr))
                 try:
                     count = int(frames.value)
                     if count and not self._paused:
+                        self._fill_timeline(int(qpc.value), int(pos.value),
+                                            count)
                         if int(flags.value) & _AUDCLNT_BUFFERFLAGS_SILENT:
                             pcm = b"\x00" * (count * TARGET_BLOCK)
                         else:
