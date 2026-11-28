@@ -458,6 +458,7 @@ class RegionFrame(object):
         self.region = None
         self.inside = False
         self.excluded = False
+        self._screen_rects = []
 
     def _strip(self, idx):
         while len(self.wins) <= idx:
@@ -518,13 +519,23 @@ class RegionFrame(object):
                 self.excluded = make_overlay(win, self.alpha, True)
             except Exception:
                 pass
+        self._screen_rects = [(gx, gy, gx + max(1, gw), gy + max(1, gh))
+                              for gx, gy, gw, gh in geo]
 
     def hide(self):
+        self._screen_rects = []
         for w in self.wins:
             try:
                 w.withdraw()
             except Exception:
                 pass
+
+    def screen_rects(self):
+        """当前可见的红色边框矩形 (left, top, right, bottom)。
+
+        由主线程在 set_region 时缓存，录制线程只读缓存，避免跨线程调用 Tk。
+        """
+        return list(self._screen_rects)
 
     def destroy(self):
         for w in self.wins:
@@ -1289,6 +1300,7 @@ class App(object):
 
         self.floating = FloatingControl(self)
         self.frame = RegionFrame(self)
+        self.recorder.exclude_provider = self._capture_exclude_rects
         self._refresh_frame()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1852,6 +1864,22 @@ class App(object):
         except Exception:
             pass
         self.root.update()
+
+    def _capture_exclude_rects(self):
+        """要在抓屏后覆盖掉的自身叠加层（悬浮控件、红色选区框）。"""
+        rects = []
+        try:
+            if self.floating and self.floating.win:
+                r = self.floating.ft.rect()
+                if r:
+                    rects.append(r)
+        except Exception:
+            pass
+        try:
+            rects.extend(self.frame.screen_rects())
+        except Exception:
+            pass
+        return rects
 
     def _restore_after_record(self):
         """录制结束：把主窗口从最小化还原并置前。"""

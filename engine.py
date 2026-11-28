@@ -54,6 +54,7 @@ SM_CYSCREEN = 1
 
 CREATE_NO_WINDOW = 0x08000000
 SRCCOPY = 0x00CC0020
+CAPTUREBLT = 0x40000000
 
 
 def enable_dpi_awareness():
@@ -370,13 +371,29 @@ class GdiGrabber(object):
             self._bmp_size = (w, h)
             gdi32.SelectObject(self._mem_dc, self._bmp)
 
-    def grab(self, x, y, w, h, cursor=False):
+    def grab(self, x, y, w, h, cursor=False, exclude=None):
         w = max(1, int(w))
         h = max(1, int(h))
         self._ensure(w, h)
+        # CAPTUREBLT：把 WS_EX_LAYERED 窗口（Cmder/ConEmu 等）也纳入抓屏。
         if not gdi32.BitBlt(self._mem_dc, 0, 0, w, h, self._screen_dc,
-                            int(x), int(y), SRCCOPY):
+                            int(x), int(y), SRCCOPY | CAPTUREBLT):
             raise OSError("BitBlt 失败")
+        # 悬浮控件 / 红色选区框本身也是分层窗口；先用不带 CAPTUREBLT 的
+        # BitBlt 覆盖这些小区域，把它们从画面里去掉。
+        for rect in exclude or ():
+            try:
+                left, top, right, bottom = [int(v) for v in rect]
+                left = max(left, int(x))
+                top = max(top, int(y))
+                right = min(right, int(x) + w)
+                bottom = min(bottom, int(y) + h)
+                if right > left and bottom > top:
+                    gdi32.BitBlt(self._mem_dc, left - int(x), top - int(y),
+                                 right - left, bottom - top, self._screen_dc,
+                                 left, top, SRCCOPY)
+            except Exception:
+                pass
         if cursor:
             _draw_cursor_on_dc(self._mem_dc, x, y, w, h)
         bi = _BitmapInfoHeader()
@@ -408,7 +425,7 @@ class GdiGrabber(object):
 
 
 class PillowGrabber(object):
-    def grab(self, x, y, w, h, cursor=False):
+    def grab(self, x, y, w, h, cursor=False, exclude=None):
         from PIL import ImageGrab
         try:
             img = ImageGrab.grab(bbox=(x, y, x + int(w), y + int(h)),
@@ -944,6 +961,7 @@ class Recorder(object):
         self.preview = None
         self.error = ""
         self.capture_cursor = True
+        self.exclude_provider = None
         self.writer = None
         self._thread = None
         self._running = False
@@ -1450,7 +1468,15 @@ class Recorder(object):
                     time.sleep(0.03)
                     next_t = time.perf_counter()
                     continue
-                img = self._grabber.grab(x, y, w, h, cursor=self.capture_cursor)
+                exclude = None
+                if callable(self.exclude_provider):
+                    try:
+                        exclude = self.exclude_provider()
+                    except Exception:
+                        exclude = None
+                img = self._grabber.grab(x, y, w, h,
+                                         cursor=self.capture_cursor,
+                                         exclude=exclude)
                 if img.size != (out_w, out_h):
                     img = img.resize((out_w, out_h), Image.BILINEAR)
                 with self._writer_lock:

@@ -55,6 +55,7 @@
 | 录制控制 | 开始 / 暂停 / 继续 / 结束；暂停期间不计入视频时长 |
 | **全局热键** | 程序在后台或最小化时依然有效（系统级注册），`F9` 开始 / 结束、`F10` 暂停 / 继续 |
 | 悬浮控件 | 录制中主界面**最小化到任务栏**，**右下角**圆形控件显示时长（距右边 20px、距任务栏 20px），点击**向左展开圆弧操作区**（暂停 / 继续 / 结束），可拖动 |
+| 分层窗口 | Cmder / ConEmu 等 `WS_EX_LAYERED` 窗口也能正常录进画面 |
 | 单实例 | 只能开一个窗口；重复双击会把已打开的界面还原到前台（录制中也能唤回） |
 | 自动保存 | 结束即保存，文件名形如 `录屏_20261113_203641.mp4` |
 | **后台保存** | 结束录制**立即回到主界面**，拼接 / 合并音轨在后台进行，状态区显示实时进度 |
@@ -221,9 +222,14 @@ F9 / F10 通过 `RegisterHotKey` 注册为系统级热键，因此程序运行�
 
 ### 1. 屏幕采集（`engine.GdiGrabber`）
 
-`BitBlt`（`SRCCOPY`）把屏幕位图拷到内存 DC，再用 `GetDIBits` 取 32 位 `BGRX` 原始像素，
-交给 Pillow 组装成 `RGB` 图像。相比 `ImageGrab` 每次重新建 DC，复用 DC/位图后单帧约 18 ms；
-失败自动回退 `PIL.ImageGrab`（`all_screens=True`）。
+`BitBlt`（`SRCCOPY | CAPTUREBLT`）把屏幕位图拷到内存 DC，再用 `GetDIBits` 取 32 位
+`BGRX` 原始像素，交给 Pillow 组装成 `RGB` 图像。相比 `ImageGrab` 每次重新建 DC，复用
+DC/位图后单帧约 20 ms；失败自动回退 `PIL.ImageGrab`（`all_screens=True`）。
+
+`CAPTUREBLT` 是 Cmder / ConEmu 这类 `WS_EX_LAYERED` 分层窗口能被录进去的关键；普通
+`SRCCOPY` 会直接漏掉它们。带上 `CAPTUREBLT` 后，程序自己的悬浮控件和红色选区框也会
+被捕获，所以抓屏完成后会用不带 `CAPTUREBLT` 的 `BitBlt` 把这两个小区域覆盖回底层画面，
+既录到 Cmder，又不会把控件录进视频。
 
 鼠标指针由 `GetCursorInfo` + `DrawIconEx` 直接画到内存 DC 上：`DrawIconEx` 以左上角定位，
 所以绘制点要用「光标坐标 − 热点」，热点通过 `GetIconInfo` 读取并缓存。
@@ -308,10 +314,8 @@ Tk 窗口——Tk 的 `Toplevel` 属于 Tk 的窗口树，主窗口最小化 / �
 `IAudioClient` 打开 `AUDCLNT_STREAMFLAGS_LOOPBACK` 环回流，再由
 `IAudioCaptureClient` 逐包读取「扬声器正在播放的混音」，**不需要虚拟声卡或额外驱动**。
 
-- 优先请求 48 kHz / 双声道 / 16-bit PCM 并打开 `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`，
-  由 Windows 完成重采样与下混，采集线程原样写 WAV，CPU 占用最低；
-- 设备不接受自动转换时，退回设备自己的混音格式，按 16/24/32-bit PCM、float32/64
-  以及 `WAVEFORMATEXTENSIBLE` 的声道掩码转换成双声道 16-bit；
+- 直接用设备 `GetMixFormat` 返回的实际采样率、声道和样本格式打开共享环回流，再转换成
+  双声道 16-bit WAV；不强行改 48 kHz，避免 44.1 kHz 设备被误标后声音变快；
 - 采集线程只负责「取包 → 写 WAV」，暂停时继续排空设备缓冲但不写入，因此 WAV 的有效
   时长与视频一致；
 - 部分声卡在系统静音时完全不产生环回包；采集线程会根据 `GetBuffer` 的 QPC 时间和设备
@@ -380,9 +384,14 @@ Tk 窗口——Tk 的 `Toplevel` 属于 Tk 的窗口树，主窗口最小化 / �
 
 **Q：外框和圆形控件会被录进视频吗？**
 
-选区红框不会：它被标记为「不参与屏幕捕获」。圆形控件是逐像素透明的分层窗口，Windows 不允许
-这类窗口设置同样的标记，所以**全屏录制时控件可能出现在画面右侧**；用「自定义区域」录制并把
-区域避开控件位置即可（控件可以拖到任意角落）。
+都不会。抓屏时会先用 `CAPTUREBLT` 把分层窗口录进来，再用不带 `CAPTUREBLT` 的 `BitBlt`
+把红色外框和圆形控件所在的小区域覆盖回底层画面，因此它们不会出现在视频里。
+
+**Q：Cmder / ConEmu 窗口录不进去？**
+
+旧版抓屏只用 `SRCCOPY`，而 Cmder / ConEmu 的主窗口是 `WS_EX_LAYERED` 分层窗口，会被
+直接漏掉。现在已改为 `SRCCOPY | CAPTUREBLT`，可以正常录到。若仍然看不到，请确认
+Cmder 没有被最小化、没有被移到其他虚拟桌面，并且确实显示在录制区域内。
 
 **Q：为什么选了 MP4 却保存成 AVI？**
 
