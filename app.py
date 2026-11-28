@@ -5,7 +5,9 @@ ATUSU 录屏 - 主界面
 支持 Windows 7 / 8 / 10 / 11
   * 全屏 / 自定义区域录制，区域外框以红色实线常显
   * 录制时主界面自动最小化到任务栏，右侧出现圆形录制控件（暂停 / 继续 / 结束）
+  * 可勾选录制系统声音（WASAPI 环回，扬声器输出），暂停时同步暂停
   * 录制完成后自动还原主界面并生成录屏记录
+  * F9 / F10 为系统级热键：程序在后台或最小化时依然可用
   * 单实例运行：重复启动只会把已打开的窗口还原到前台
 """
 
@@ -13,6 +15,7 @@ import os
 import sys
 import math
 import time
+import queue
 import ctypes
 import datetime
 import webbrowser
@@ -24,6 +27,8 @@ from tkinter import ttk, filedialog, messagebox
 import engine as E
 import overlayui as O
 import floatwin as Fw
+import hotkeys as H
+import audiocap as AC
 
 
 class _POINT(ctypes.Structure):
@@ -453,6 +458,7 @@ class RegionFrame(object):
         self.region = None
         self.inside = False
         self.excluded = False
+        self._screen_rects = []
 
     def _strip(self, idx):
         while len(self.wins) <= idx:
@@ -513,13 +519,23 @@ class RegionFrame(object):
                 self.excluded = make_overlay(win, self.alpha, True)
             except Exception:
                 pass
+        self._screen_rects = [(gx, gy, gx + max(1, gw), gy + max(1, gh))
+                              for gx, gy, gw, gh in geo]
 
     def hide(self):
+        self._screen_rects = []
         for w in self.wins:
             try:
                 w.withdraw()
             except Exception:
                 pass
+
+    def screen_rects(self):
+        """当前可见的红色边框矩形 (left, top, right, bottom)。
+
+        由主线程在 set_region 时缓存，录制线程只读缓存，避免跨线程调用 Tk。
+        """
+        return list(self._screen_rects)
 
     def destroy(self):
         for w in self.wins:
@@ -1164,6 +1180,7 @@ class AboutDialog(object):
             "录制画面包含鼠标指针与全部窗口（含系统弹窗）",
             "支持原始 / 4K / 2K / 1080P / 720P / 480P 分辨率输出",
             "支持 MP4（H.264）、AVI（MJPEG）、GIF 动图三种格式",
+            "可勾选录制系统声音（扬声器输出，不含麦克风），暂停时同步暂停",
             "开始 / 暂停 / 继续 / 结束，录制中主界面最小化到任务栏、右下角悬浮圆形控件操作",
             "结束即自动保存，并回到主界面生成录屏记录",
             "录屏记录支持右键「打开文件」「打开文件位置」",
@@ -1184,8 +1201,9 @@ class AboutDialog(object):
             tk.Label(pad, text=t, bg=CARD, fg=TEXT, font=(f, 9),
                      anchor="w", justify="left").pack(fill="x", pady=1)
 
-        tip_txt = ("提示：主界面可按 F9 开始 / 结束，F10 暂停 / 继续；圆形控件可拖动位置；"
-                   "重复双击程序不会开出第二个窗口，只会把已打开的界面还原到前台。")
+        tip_txt = ("提示：勾选「录制系统声音」可录下扬声器播放的声音（GIF 不支持，AVI 需要 ffmpeg）；"
+                   "程序在后台或最小化时，F9 开始 / 结束、F10 暂停 / 继续同样有效；"
+                   "圆形控件可拖动位置；重复双击程序不会开出第二个窗口，只会把已打开的界面还原到前台。")
         if E.IS_PACKED_FFMPEG:
             tip_txt += "\n本版已内置 ffmpeg，可直接输出 MP4，无需安装任何外部程序。"
         elif E.IS_SINGLE_FILE:
@@ -1197,7 +1215,8 @@ class AboutDialog(object):
                        highlightbackground=BORDER, highlightcolor=BORDER)
         tip.pack(fill="x", pady=(9, 0))
         tk.Label(tip, text=tip_txt, bg="#F6F8FC", fg=MUTED, font=(f, 9),
-                 justify="left", anchor="w").pack(fill="x", padx=12, pady=9)
+                 justify="left", anchor="w", wraplength=720).pack(
+                     fill="x", padx=12, pady=9)
 
         tk.Frame(pad, bg=BORDER, height=1).pack(fill="x", pady=(10, 8))
 
@@ -1256,6 +1275,7 @@ class App(object):
         self._families = set(tkfont.families())
         self.region = tuple(self.settings.get("region") or ())
         self._stopping = False
+        self._hotkey_busy = False
         self._blink = False
         self._status_job = None
         self._status_raw = ""
@@ -1280,11 +1300,13 @@ class App(object):
 
         self.floating = FloatingControl(self)
         self.frame = RegionFrame(self)
+        self.recorder.exclude_provider = self._capture_exclude_rects
         self._refresh_frame()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
-        root.bind("<F9>", lambda e: self._hotkey_start_stop())
-        root.bind("<F10>", lambda e: self._hotkey_pause_resume())
+        # F9 / F10 注册为系统级热键：主界面最小化或切到后台后依旧有效。
+        # 事件由 hotkeys 模块转回 Tk 主线程，这里收到的回调可以安全操作界面。
+        self.hotkeys = H.GlobalHotkeys(root, self._on_hotkey).start()
         self.root.after(150, self._tick)
 
     # ------------------------------------------------------------ 基础
@@ -1342,6 +1364,10 @@ class App(object):
                bordercolor=[("focus", CARD), ("!focus", CARD)],
                lightcolor=[("focus", CARD), ("!focus", CARD)],
                darkcolor=[("focus", CARD), ("!focus", CARD)])
+        st.configure("Saving.Horizontal.TProgressbar",
+                     troughcolor="#E9EEF6", background=ACCENT,
+                     bordercolor="#E9EEF6", lightcolor=ACCENT,
+                     darkcolor=ACCENT, thickness=8)
 
     def _card(self, parent):
         # highlightcolor 与 highlightbackground 同色：聚焦时也不会变成黑框
@@ -1438,7 +1464,7 @@ class App(object):
         self.cb_fmt = ttk.Combobox(right2, textvariable=self.fmt_var,
                                    values=FORMATS, state="readonly", width=13)
         self.cb_fmt.pack(side="left")
-        self.cb_fmt.bind("<<ComboboxSelected>>", lambda e: self._save_settings())
+        self.cb_fmt.bind("<<ComboboxSelected>>", self._on_fmt_change)
         # 没有 ffmpeg 时 MP4 不可用，直接切到 AVI，避免每次录制都降级
         self._ffmpeg_ready = bool(E.find_ffmpeg())
         if not self._ffmpeg_ready and self.fmt_var.get().startswith("MP4"):
@@ -1452,7 +1478,66 @@ class App(object):
                                    values=FPS_LIST, state="readonly", width=5)
         self.cb_fps.pack(side="left")
         self.cb_fps.bind("<<ComboboxSelected>>", lambda e: self._save_settings())
+
+        r3 = tk.Frame(inner, bg=CARD)
+        r3.pack(fill="x", pady=(8, 0))
+        self.audio_var = tk.BooleanVar(
+            value=bool(self.settings.get("audio", False)))
+        self.chk_audio = tk.Checkbutton(
+            r3, text="录制系统声音", variable=self.audio_var,
+            command=self._on_audio_toggle, bg=CARD, fg=TEXT,
+            activebackground=CARD, activeforeground=TEXT,
+            selectcolor="#FFFFFF", disabledforeground="#A6AEBB",
+            font=(self.font, 9), bd=0, highlightthickness=0,
+            anchor="w", cursor="hand2")
+        self.chk_audio.pack(side="left")
+        self.lbl_audio = self._label(r3, "", 8, MUTED)
+        self.lbl_audio.pack(side="left", padx=(10, 0))
         return card
+
+    def _audio_supported(self):
+        """当前格式 + 编码器能否容纳系统声音。"""
+        return (self._fmt_code() in ("MP4", "AVI")
+                and bool(getattr(self, "_ffmpeg_ready", False)))
+
+    def _on_audio_toggle(self):
+        self._save_settings()
+        self._update_audio_state()
+
+    def _on_fmt_change(self, _e=None):
+        self._save_settings()
+        self._update_audio_state()
+
+    def _update_audio_state(self):
+        """声音复选框的可用状态与说明文字。"""
+        if not hasattr(self, "chk_audio"):
+            return
+        busy = bool(getattr(self, "_stopping", False))
+        idle = (not self.recorder.is_active) and not busy
+        supported = self._audio_supported()
+        try:
+            self.chk_audio.configure(
+                state="normal" if (idle and supported) else "disabled")
+        except Exception:
+            pass
+        if busy:
+            hint = "正在保存文件…"
+        elif not idle:
+            hint = "录制中不可更改"
+        elif not getattr(self, "_ffmpeg_ready", False):
+            hint = "录制声音需要 ffmpeg"
+        elif self._fmt_code() == "GIF":
+            hint = "GIF 不支持声音"
+        elif not supported:
+            hint = "当前格式不支持声音"
+        elif self.audio_var.get():
+            hint = "将录制扬声器输出（不含麦克风）"
+        else:
+            hint = "勾选后录制扬声器输出（不含麦克风）"
+        try:
+            self.lbl_audio.configure(text=hint)
+        except Exception:
+            pass
 
     def _build_controls(self, parent):
         bar = tk.Frame(parent, bg=BG)
@@ -1493,6 +1578,24 @@ class App(object):
         self.lbl_timer = tk.Label(box, text="00:00", bg=BG, fg=TEXT,
                                   font=tfont)
         self.lbl_timer.pack(side="left", padx=(12, 0))
+        self._ctrl_box = box
+
+        # 结束录制后的后台封装进度（不阻塞主界面回到前台）
+        self.save_box = tk.Frame(right, bg=BG)
+        self.lbl_save_stage = tk.Label(
+            self.save_box, text="正在保存…", bg=BG, fg=TEXT,
+            font=(self.font, 10, "bold"))
+        self.lbl_save_stage.pack(anchor="center")
+        srow = tk.Frame(self.save_box, bg=BG)
+        srow.pack(anchor="center", pady=(5, 0))
+        self.pb_save = ttk.Progressbar(
+            srow, orient="horizontal", mode="determinate", maximum=100,
+            length=300, style="Saving.Horizontal.TProgressbar")
+        self.pb_save.pack(side="left")
+        self.lbl_save_pct = tk.Label(srow, text="0%", bg=BG, fg=ACCENT,
+                                     width=5, anchor="w",
+                                     font=(self.font, 10, "bold"))
+        self.lbl_save_pct.pack(side="left", padx=(8, 0))
         return bar
 
     def _build_records(self, parent):
@@ -1514,12 +1617,13 @@ class App(object):
         body = tk.Frame(card, bg=CARD)
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        cols = ("name", "duration", "size", "res", "fmt", "time")
+        cols = ("name", "duration", "size", "res", "fmt", "audio", "time")
         self.tree = ttk.Treeview(body, columns=cols, show="headings",
                                  selectmode="browse", height=6)
-        heads = {"name": ("文件名", 320), "duration": ("时长", 78),
+        heads = {"name": ("文件名", 300), "duration": ("时长", 78),
                  "size": ("大小", 88), "res": ("分辨率", 110),
-                 "fmt": ("格式", 68), "time": ("录制时间", 176)}
+                 "fmt": ("格式", 64), "audio": ("声音", 52),
+                 "time": ("录制时间", 176)}
         for c in cols:
             text, width = heads[c]
             self.tree.heading(c, text=text, anchor="w")
@@ -1580,7 +1684,7 @@ class App(object):
         tk.Label(bar, text="© 2026 %s　保留所有权利" % E.APP_PUBLISHER,
                  bg=CARD, fg=MUTED, font=(self.font, 9)).pack(side="right")
         self._dot(bar).pack(side="right", padx=9)
-        tk.Label(bar, text="F9 开始/结束　F10 暂停/继续", bg=CARD,
+        tk.Label(bar, text="F9 开始/结束　F10 暂停/继续（全局）", bg=CARD,
                  fg="#9AA3AF", font=(self.font, 9)).pack(side="right",
                                                          padx=(0, 16))
 
@@ -1601,6 +1705,8 @@ class App(object):
             "resolution": self.res_var.get(),
             "fps": self.fps_var.get(),
             "format": self.fmt_var.get(),
+            "audio": (bool(self.audio_var.get())
+                      if hasattr(self, "audio_var") else False),
             "region": list(self.region) if self.region else None,
         })
         self.store.save_settings(self.settings)
@@ -1759,6 +1865,22 @@ class App(object):
             pass
         self.root.update()
 
+    def _capture_exclude_rects(self):
+        """要在抓屏后覆盖掉的自身叠加层（悬浮控件、红色选区框）。"""
+        rects = []
+        try:
+            if self.floating and self.floating.win:
+                r = self.floating.ft.rect()
+                if r:
+                    rects.append(r)
+        except Exception:
+            pass
+        try:
+            rects.extend(self.frame.screen_rects())
+        except Exception:
+            pass
+        return rects
+
     def _restore_after_record(self):
         """录制结束：把主窗口从最小化还原并置前。"""
         try:
@@ -1788,6 +1910,22 @@ class App(object):
         ext = FORMAT_EXT.get(use_fmt, ".mp4")
         path = self._unique_path(ext)
 
+        # 系统声音：先做一次快速预检，避免开始录制后才发现没有播放设备，
+        # 那时主界面已经最小化，提示反而不容易被看到。
+        audio = bool(self.audio_var.get()) and self._audio_supported()
+        if audio:
+            self._set_status("正在检查系统声音…", hold=True)
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
+            ok, reason = AC.probe(timeout=3.0)
+            if not ok:
+                audio = False
+                messagebox.showwarning(
+                    "系统声音不可用",
+                    "无法录制系统声音：\n%s\n\n本次将仅录制视频。" % reason)
+
         # 先最小化主界面（任务栏图标保留，随时能点回来），避免它出现在录制画面里。
         # 不用 withdraw：主窗口隐藏会让任务栏图标一起消失。
         self._minimize_for_record()
@@ -1801,7 +1939,7 @@ class App(object):
 
         try:
             self.recorder.start(region, (out_w, out_h), int(self.fps_var.get()),
-                                fmt, path)
+                                fmt, path, audio=audio)
         except Exception as e:
             self.floating.hide()
             self._restore_after_record()
@@ -1813,7 +1951,13 @@ class App(object):
         if fmt == "MP4" and self.recorder.effective_fmt != "MP4":
             self._set_status("未检测到 ffmpeg，本次改存为 AVI")
         else:
-            self._set_status("正在录制：%s" % os.path.basename(path))
+            base = "正在录制：%s" % os.path.basename(path)
+            if self.recorder.audio_error:
+                self._set_status(base + "（系统声音未启用）")
+            elif self.recorder.audio_active:
+                self._set_status(base + "（含系统声音）")
+            else:
+                self._set_status(base)
         self._sync_state()
 
     def _pause(self):
@@ -1834,29 +1978,102 @@ class App(object):
         if not self.recorder.is_active or self._stopping:
             return
         self._stopping = True
-        self._set_status("正在保存文件…")
+        self._stop_fmt = self.recorder.fmt
+        self._save_queue = queue.Queue()
+        self._set_status("正在结束录制…")
         try:
             self.btn_stop.set_enabled(False)
         except Exception:
             pass
         if self.floating:
             self.floating.hide()
-        fmt = self.recorder.fmt
-        info = self.recorder.stop()
-        err = self.recorder.error
-        self._stopping = False
 
-        # 结束录制 -> 自动回到主界面展示录屏记录
+        # 先让采集线程停下，再把拼接 / 合并交给后台线程；主界面立即回前台。
+        started = self.recorder.stop_async(
+            lambda info, err: self._save_queue.put(("done", info, err)),
+            lambda pct, msg: self._save_queue.put(("progress", pct, msg)))
+        if not started:
+            self._stopping = False
+            self._set_status("")
+            self._sync_state()
+            return
         self._restore_after_record()
+        self._show_saving(0.0, "正在停止采集…")
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        self._sync_state()
 
+    def _show_saving(self, pct, text):
+        try:
+            self._ctrl_box.pack_forget()
+            self.lbl_save_stage.configure(text=text)
+            self.pb_save["value"] = max(0, min(100, pct * 100))
+            self.lbl_save_pct.configure(text="%d%%" % int(pct * 100))
+            self.save_box.pack(expand=True)
+        except Exception:
+            pass
+
+    def _hide_saving(self):
+        try:
+            self.save_box.pack_forget()
+            self._ctrl_box.pack(expand=True)
+            self.pb_save["value"] = 0
+            self.lbl_save_pct.configure(text="0%")
+        except Exception:
+            pass
+
+    def _set_saving_progress(self, pct, text=None):
+        if not self._stopping:
+            return
+        try:
+            pct = max(0.0, min(1.0, float(pct)))
+            self.pb_save["value"] = pct * 100
+            self.lbl_save_pct.configure(text="%d%%" % int(pct * 100))
+            if text:
+                self.lbl_save_stage.configure(text=text)
+        except Exception:
+            pass
+
+    def _poll_save_queue(self):
+        q = getattr(self, "_save_queue", None)
+        if q is None:
+            return
+        while True:
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                break
+            if item[0] == "progress":
+                self._set_saving_progress(item[1], item[2])
+            elif item[0] == "done":
+                self._save_queue = None
+                self._finish_save(item[1], item[2])
+                break
+
+    def _finish_save(self, info, err):
+        if info and info.get("size"):
+            self._set_saving_progress(1.0, "保存完成")
+        self._stopping = False
+        self._hide_saving()
+        fmt = getattr(self, "_stop_fmt", self.recorder.fmt)
         if info and info.get("size"):
             if self.recorder.effective_fmt != fmt:
                 info["note"] = "已自动改用 %s 格式" % self.recorder.effective_fmt
             self.records.insert(0, info)
             self.store.save_records(self.records)
             self._refresh_records_tree(select_path=info["path"])
-            self._set_status("已保存：%s（%s）" % (info["name"],
-                                                 E.human_size(info["size"])))
+            msg = "已保存：%s（%s）" % (info["name"],
+                                       E.human_size(info["size"]))
+            if info.get("audio"):
+                msg += (" · 含系统声音" if not self.recorder.audio_error
+                        else " · 含部分系统声音")
+            elif self.recorder.audio_requested:
+                msg += " · 未含系统声音"
+            elif self.recorder.error:
+                msg += " · 视频时间轴处理异常"
+            self._set_status(msg)
         else:
             self._set_status("录制未生成文件")
             if err:
@@ -1864,6 +2081,25 @@ class App(object):
 
         self._sync_state()
         self._refresh_frame()
+
+    def _on_hotkey(self, action):
+        """全局热键回调（Tk 主线程）：录制控制不允许重入。"""
+        if self._hotkey_busy:
+            return
+        # 正在选择录制区域时主窗口是 withdraw 状态，此时按热键会打乱选区流程
+        try:
+            if self.root.state() == "withdrawn":
+                return
+        except Exception:
+            pass
+        self._hotkey_busy = True
+        try:
+            if action == H.ACTION_START_STOP:
+                self._hotkey_start_stop()
+            elif action == H.ACTION_PAUSE_RESUME:
+                self._hotkey_pause_resume()
+        finally:
+            self._hotkey_busy = False
 
     def _hotkey_start_stop(self):
         if self.recorder.is_active:
@@ -1882,17 +2118,23 @@ class App(object):
         idle = st == E.STATE_IDLE
         rec = st == E.STATE_RECORDING
         paused = st == E.STATE_PAUSED
+        busy = bool(getattr(self, "_stopping", False))
 
-        self.btn_start.set_enabled(idle)
+        self.btn_start.set_enabled(idle and not busy)
         self.btn_pause.set_enabled(rec)
         self.btn_resume.set_enabled(paused)
         self.btn_stop.set_enabled(rec or paused)
-        self.cb_area.configure(state="readonly" if idle else "disabled")
-        self.cb_res.configure(state="readonly" if idle else "disabled")
-        self.cb_fps.configure(state="readonly" if idle else "disabled")
-        self.cb_fmt.configure(state="readonly" if idle else "disabled")
-        self.ent_dir.configure(state="normal" if idle else "disabled")
-        self.btn_region.set_enabled(idle)
+        self.cb_area.configure(state="readonly"
+                               if (idle and not busy) else "disabled")
+        self.cb_res.configure(state="readonly"
+                              if (idle and not busy) else "disabled")
+        self.cb_fps.configure(state="readonly"
+                              if (idle and not busy) else "disabled")
+        self.cb_fmt.configure(state="readonly"
+                              if (idle and not busy) else "disabled")
+        self.ent_dir.configure(state="normal"
+                               if (idle and not busy) else "disabled")
+        self.btn_region.set_enabled(idle and not busy)
 
         if idle:
             self.lbl_state.configure(text="●  准备就绪", fg=MUTED)
@@ -1902,6 +2144,7 @@ class App(object):
         else:
             self.lbl_state.configure(text="●  已暂停", fg="#B45309")
         self._update_region_label()
+        self._update_audio_state()
 
     # ------------------------------------------------------------ 定时刷新
     def _tick(self):
@@ -1912,6 +2155,7 @@ class App(object):
         self.root.after(150, self._tick)
 
     def _tick_once(self):
+        self._poll_save_queue()
         rec = self.recorder
         if rec.is_active:
             txt = E.human_duration(rec.elapsed())
@@ -1993,6 +2237,7 @@ class App(object):
                         E.human_size(r.get("size", 0)) if exists else "已丢失",
                         "%d×%d" % (r.get("width", 0), r.get("height", 0)),
                         r.get("format", "-"),
+                        "有声" if r.get("audio") else "—",
                         r.get("created", "-")),
                 tags=() if exists else ("missing",))
         self.records = valid
@@ -2096,6 +2341,14 @@ class App(object):
 
     # ------------------------------------------------------------ 关闭
     def _on_close(self):
+        if self._stopping:
+            # 后台还在拼接 / 合并，等完成后再关，避免留下半成品。
+            self._set_status("正在保存文件，请稍候再关闭…")
+            try:
+                self.root.bell()
+            except Exception:
+                pass
+            return
         if self.recorder.is_active:
             if not messagebox.askyesno("正在录制",
                                        "当前正在录制，退出将停止并保存文件。是否继续退出？"):
@@ -2104,6 +2357,10 @@ class App(object):
             self.recorder.stop()
         try:
             self.floating.hide()
+        except Exception:
+            pass
+        try:
+            self.hotkeys.close()
         except Exception:
             pass
         try:

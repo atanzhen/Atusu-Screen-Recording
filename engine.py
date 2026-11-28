@@ -7,6 +7,7 @@ atusu 录屏 - 采集与编码引擎
   * MP4(H.264) 通过 ffmpeg 管道实时编码
   * AVI(MJPG) 内置封装器，无需任何外部程序
   * GIF 动图收集器
+  * 可选的系统声音（WASAPI 环回）：MP4 写入 AAC、AVI 写入 PCM
 """
 
 import os
@@ -15,11 +16,14 @@ import time
 import json
 import struct
 import shutil
+import tempfile
 import threading
 import subprocess
 import datetime
 
 from PIL import Image
+
+import audiocap
 
 APP_NAME = "ATUSU 录屏"
 APP_VERSION = "1.3.3"
@@ -50,6 +54,7 @@ SM_CYSCREEN = 1
 
 CREATE_NO_WINDOW = 0x08000000
 SRCCOPY = 0x00CC0020
+CAPTUREBLT = 0x40000000
 
 
 def enable_dpi_awareness():
@@ -366,13 +371,29 @@ class GdiGrabber(object):
             self._bmp_size = (w, h)
             gdi32.SelectObject(self._mem_dc, self._bmp)
 
-    def grab(self, x, y, w, h, cursor=False):
+    def grab(self, x, y, w, h, cursor=False, exclude=None):
         w = max(1, int(w))
         h = max(1, int(h))
         self._ensure(w, h)
+        # CAPTUREBLT：把 WS_EX_LAYERED 窗口（Cmder/ConEmu 等）也纳入抓屏。
         if not gdi32.BitBlt(self._mem_dc, 0, 0, w, h, self._screen_dc,
-                            int(x), int(y), SRCCOPY):
+                            int(x), int(y), SRCCOPY | CAPTUREBLT):
             raise OSError("BitBlt 失败")
+        # 悬浮控件 / 红色选区框本身也是分层窗口；先用不带 CAPTUREBLT 的
+        # BitBlt 覆盖这些小区域，把它们从画面里去掉。
+        for rect in exclude or ():
+            try:
+                left, top, right, bottom = [int(v) for v in rect]
+                left = max(left, int(x))
+                top = max(top, int(y))
+                right = min(right, int(x) + w)
+                bottom = min(bottom, int(y) + h)
+                if right > left and bottom > top:
+                    gdi32.BitBlt(self._mem_dc, left - int(x), top - int(y),
+                                 right - left, bottom - top, self._screen_dc,
+                                 left, top, SRCCOPY)
+            except Exception:
+                pass
         if cursor:
             _draw_cursor_on_dc(self._mem_dc, x, y, w, h)
         bi = _BitmapInfoHeader()
@@ -404,7 +425,7 @@ class GdiGrabber(object):
 
 
 class PillowGrabber(object):
-    def grab(self, x, y, w, h, cursor=False):
+    def grab(self, x, y, w, h, cursor=False, exclude=None):
         from PIL import ImageGrab
         try:
             img = ImageGrab.grab(bbox=(x, y, x + int(w), y + int(h)),
@@ -533,8 +554,20 @@ class AviWriter(object):
         self.frames += 1
         self.bytes_written += len(data)
 
-    def close(self):
+    def close(self, final_fps=None):
         f = self._f
+        if final_fps:
+            # 抓屏达不到设定帧率时会丢帧；按「实际帧数 / 真实时长」回写帧率，
+            # 播放时长才会与真实录制时长一致，不会出现画面加速。
+            final_fps = min(240.0, max(1.0, float(final_fps)))
+            self.fps = final_fps
+            micro = max(1, int(round(1000000.0 / final_fps)))
+            rate = max(1, int(round(final_fps * 1000.0)))
+            f.seek(self._avih_pos)
+            f.write(struct.pack("<I", micro))
+            f.seek(self._strh_pos + 20)
+            f.write(struct.pack("<II", 1000, rate))
+            f.seek(0, os.SEEK_END)
         end = f.tell()
         movi_size = end - self._movi_fourcc_pos
         f.seek(self._movi_size_pos)
@@ -558,8 +591,39 @@ class AviWriter(object):
         return self.path
 
 
+_FPS_MODE_CACHE = {}
+
+
+def _fps_mode_args(ffmpeg):
+    """返回让 ffmpeg 保留 VFR 时间戳的参数（兼容新旧版本）。"""
+    if ffmpeg in _FPS_MODE_CACHE:
+        return _FPS_MODE_CACHE[ffmpeg]
+    args = ["-fps_mode", "vfr"]          # ffmpeg 5.1+
+    try:
+        p = subprocess.Popen([ffmpeg, "-hide_banner", "-h", "full"],
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT,
+                             creationflags=CREATE_NO_WINDOW)
+        out, _ = p.communicate(timeout=20)
+        if b"-fps_mode" not in out:
+            if b"-vsync" in out:         # 老版本
+                args = ["-vsync", "vfr"]
+            else:
+                args = []
+    except Exception:
+        pass
+    _FPS_MODE_CACHE[ffmpeg] = args
+    return args
+
+
 class FfmpegWriter(object):
-    """把原始 RGB 帧通过管道交给 ffmpeg 实时编码为 H.264 MP4。"""
+    """把原始 RGB 帧通过管道交给 ffmpeg 实时编码为 H.264 MP4。
+
+    使用 ``-use_wallclock_as_timestamps`` 让每帧按实际送达时间写入 PTS，
+    再以 VFR 输出。这样抓屏卡顿 / 掉帧时，播放机会自动延长上一帧的显示
+    时间，画面速度与系统声音保持一致；旧的固定帧率封装会把卡顿均匀摊到
+    整段视频里，导致声音越来越超前。
+    """
 
     def __init__(self, path, width, height, fps=30, ffmpeg=None, crf=23):
         self.path = path
@@ -567,6 +631,7 @@ class FfmpegWriter(object):
         self.height = int(height)
         self.fps = max(1, int(fps))
         self.frames = 0
+        self.first_frame_ts = 0.0
         self.ffmpeg = ffmpeg or find_ffmpeg()
         if not self.ffmpeg:
             raise RuntimeError("未找到 ffmpeg")
@@ -574,11 +639,13 @@ class FfmpegWriter(object):
         cmd = [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                "-f", "rawvideo", "-pix_fmt", "rgb24",
                "-s", "%dx%d" % (self.width, self.height),
-               "-r", str(self.fps), "-i", "pipe:0",
+               "-use_wallclock_as_timestamps", "1",
+               "-i", "pipe:0",
                "-an", "-vf", vf,
                "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
-               "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-               self.path]
+               "-pix_fmt", "yuv420p"]
+        cmd += _fps_mode_args(self.ffmpeg)
+        cmd += ["-movflags", "+faststart", self.path]
         self._err = None
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL,
@@ -588,6 +655,8 @@ class FfmpegWriter(object):
     def add_image(self, img):
         if img.mode != "RGB":
             img = img.convert("RGB")
+        if self.frames == 0:
+            self.first_frame_ts = time.perf_counter()
         self.proc.stdin.write(img.tobytes())
         self.frames += 1
 
@@ -647,9 +716,15 @@ class GifWriter(object):
         self._data.append(buf.getvalue())
         self.frames += 1
 
-    def close(self):
+    def close(self, duration=None):
         import io
-        delay = int(round(1000.0 / self.fps))
+        if duration and self.frames:
+            # 按真实录制时长分配每帧停留时间，丢帧时 GIF 不会被加速。
+            fps = float(self.frames) / float(duration)
+            delay = int(round(1000.0 / max(0.2, min(self.MAX_FPS, fps))))
+        else:
+            delay = int(round(1000.0 / self.fps))
+        delay = max(20, min(1000, delay))
         images = []
         for raw in self._data:
             images.append(Image.open(io.BytesIO(raw)).convert("RGB"))
@@ -764,6 +839,114 @@ def resolve_format(fmt):
     return fmt
 
 
+def _sidecar_path(path, tag):
+    """在最终文件旁边生成临时文件路径：xxx_video.mp4 / xxx_audio.wav。"""
+    base, ext = os.path.splitext(path)
+    return "%s_%s%s" % (base, tag, ext)
+
+
+def _run_ffmpeg(cmd, duration=None, progress=None, timeout=300):
+    """运行 ffmpeg，并可选地把 ``-progress`` 的完成比例回调出去。
+
+    返回 ``(returncode, 错误文本)``。stdout/stderr 合并后逐行读取，
+    既避免管道写满死锁，也能拿到进度与错误信息。
+    """
+    full = [cmd[0], "-progress", "pipe:1", "-nostats"] + list(cmd[1:])
+    proc = subprocess.Popen(full, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            creationflags=CREATE_NO_WINDOW)
+    state = {"killed": False}
+
+    def _kill():
+        state["killed"] = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    timer = threading.Timer(timeout, _kill)
+    timer.daemon = True
+    timer.start()
+    known = {"frame", "fps", "stream_0_0_q", "bitrate", "total_size",
+             "out_time_us", "out_time_ms", "out_time", "dup_frames",
+             "drop_frames", "speed", "progress"}
+    errors = []
+    out_time = 0.0
+    last_report = 0.0
+    try:
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line:
+                continue
+            key = line.split("=", 1)[0]
+            if key in known and "=" in line:
+                if key in ("out_time_us", "out_time_ms"):
+                    try:
+                        value = int(line.split("=", 1)[1])
+                        if value >= 0:
+                            out_time = value / 1000000.0
+                    except ValueError:
+                        pass
+                    if duration and progress and out_time > 0:
+                        frac = min(0.995, out_time / duration)
+                        if frac - last_report >= 0.01:
+                            last_report = frac
+                            try:
+                                progress(frac)
+                            except Exception:
+                                pass
+                continue
+            errors.append(line)
+        proc.wait()
+    finally:
+        timer.cancel()
+    if state["killed"]:
+        errors.append("ffmpeg 处理超时")
+    return proc.returncode, "\n".join(errors[-8:])
+
+
+def mux_audio(video_path, audio_path, out_path, fmt, lead=0.0,
+              duration=None, progress=None):
+    """把视频（可选声音）封装成最终文件。
+
+    ``lead`` 是音频比视频多出来的开头时长，合并时从音频开头裁掉；
+    ``duration`` 是最终时长，用于 ``-t`` 精确收尾。MP4 的时间轴在录制时
+    已经由 VFR 时间戳确定，这里只做无损封装。
+    """
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("未找到 ffmpeg，无法处理视频")
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+    cmd += ["-i", video_path]
+    if audio_path:
+        if lead and lead > 0.001:
+            cmd += ["-ss", "%.3f" % lead]
+        cmd += ["-i", audio_path,
+                "-map", "0:v:0", "-map", "1:a:0"]
+    else:
+        cmd += ["-map", "0:v:0"]
+    cmd += ["-c:v", "copy"]
+    if audio_path:
+        if fmt == "MP4":
+            cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+        else:
+            cmd += ["-c:a", "pcm_s16le", "-ac", "2"]
+        # 声音若比画面短（例如结尾是静音段），补静音到 -t 指定的时长。
+        if duration and duration > 0:
+            cmd += ["-af", "apad"]
+    if duration and duration > 0:
+        cmd += ["-t", "%.3f" % duration]
+    if fmt == "MP4":
+        cmd += ["-movflags", "+faststart"]
+    cmd += [out_path]
+    code, err = _run_ffmpeg(cmd, duration, progress)
+    if (code != 0 or not os.path.isfile(out_path)
+            or os.path.getsize(out_path) < 1024):
+        raise RuntimeError("视频处理失败：%s" %
+                           (err or "ffmpeg 未输出文件"))
+    return out_path
+
+
 class Recorder(object):
     """录制控制器：开始 / 暂停 / 继续 / 停止。"""
 
@@ -778,6 +961,7 @@ class Recorder(object):
         self.preview = None
         self.error = ""
         self.capture_cursor = True
+        self.exclude_provider = None
         self.writer = None
         self._thread = None
         self._running = False
@@ -787,6 +971,23 @@ class Recorder(object):
         self._paused_at = 0.0
         self._paused_total = 0.0
         self.effective_fmt = "MP4"
+        # 系统声音（WASAPI 环回）
+        self.audio_requested = False
+        self.audio_active = False
+        self.audio_error = ""
+        self._audio = None
+        self._audio_path = ""
+        self._video_path = ""
+        self._video_started_at = 0.0
+        self._stop_ts = 0.0
+        self._pause_ts = 0.0
+        self._paused_after_first = 0.0
+        # MP4 用 VFR 分段：暂停时收尾当前段，继续时开新段，停止后拼接。
+        self._segments = []
+        self._segment_dir = ""
+        self._segment_index = 0
+        self._first_video_ts = 0.0
+        self._writer_lock = threading.Lock()
 
     # -- 状态查询 ----------------------------------------------------
     @property
@@ -804,7 +1005,7 @@ class Recorder(object):
         return self.frame_count / float(max(1, self.fps))
 
     # -- 生命周期 ----------------------------------------------------
-    def start(self, region, out_size, fps, fmt, path):
+    def start(self, region, out_size, fps, fmt, path, audio=False):
         if self.is_active:
             raise RuntimeError("正在录制中")
         self.region = tuple(int(v) for v in region)
@@ -818,54 +1019,327 @@ class Recorder(object):
         self._paused_total = 0.0
         self._paused_at = 0.0
         self._start_ts = time.time()
+        self.audio_requested = bool(audio)
+        self.audio_active = False
+        self.audio_error = ""
+        self._audio = None
+        self._audio_path = ""
+        self._video_path = path
+        self._video_started_at = 0.0
+        self._stop_ts = 0.0
+        self._pause_ts = 0.0
+        self._paused_after_first = 0.0
+        self._segments = []
+        self._segment_dir = ""
+        self._segment_index = 0
+        self._first_video_ts = 0.0
 
         use_fmt = resolve_format(fmt)
         self.effective_fmt = use_fmt
 
+        # 声音只对有音频轨道的格式生效；AVI 需要 ffmpeg 才能把 WAV 合并进去。
+        if self.audio_requested and use_fmt == "GIF":
+            self.audio_requested = False
+            self.audio_error = "GIF 格式不支持声音"
+        if self.audio_requested and use_fmt == "AVI" and not find_ffmpeg():
+            self.audio_requested = False
+            self.audio_error = "录制系统声音需要 ffmpeg，本次仅录制视频"
+
+        use_audio = self.audio_requested
+        # MP4 用 VFR 分段录制：每段按实际抓帧时间写 PTS，暂停时收段，
+        # 停止后再拼接，避免把抓屏卡顿均匀摊到整段视频里。
+        # AVI 只在需要合并声音时才临时化，无声音的 AVI 仍直接写最终文件。
+        needs_temp = (use_fmt == "MP4") or (use_audio and use_fmt == "AVI")
+        if needs_temp:
+            self._video_path = _sidecar_path(path, "video")
+        if use_audio:
+            self._audio_path = os.path.splitext(path)[0] + "_audio.wav"
+
         w, h = self.out_size
-        if use_fmt == "MP4":
-            self.writer = FfmpegWriter(path, w, h, self.fps)
-        elif use_fmt == "AVI":
-            self.writer = AviWriter(path, w, h, self.fps)
-        else:
-            self.writer = GifWriter(path, w, h, self.fps)
+        try:
+            if use_fmt == "MP4":
+                parent = os.path.dirname(os.path.abspath(path)) or "."
+                self._segment_dir = tempfile.mkdtemp(
+                    prefix=".atusu_segs_", dir=parent)
+                self._open_segment()
+            elif use_fmt == "AVI":
+                self.writer = AviWriter(self._video_path, w, h, self.fps)
+            else:
+                self.writer = GifWriter(self._video_path, w, h, self.fps)
+        except Exception:
+            self.writer = None
+            self._cleanup_segments()
+            self._remove_file(self._video_path)
+            raise
+
+        # 视频编码器就绪后再启动声音采集：WASAPI 初始化通常比 ffmpeg 启动快，
+        # 这样声音比画面早开始的时间很短，合并时再按实际时间差裁掉开头。
+        if use_audio:
+            capture = audiocap.SystemAudioCapture(self._audio_path)
+            try:
+                capture.start()
+                self._audio = capture
+                self.audio_active = True
+            except Exception as e:
+                try:
+                    capture.stop()
+                except Exception:
+                    pass
+                self._audio = None
+                self.audio_active = False
+                self.audio_error = "系统声音不可用：%s" % e
 
         self._grabber = None
         self._running = True
         self.state = STATE_RECORDING
         self._thread = threading.Thread(target=self._loop, name="recorder")
         self._thread.daemon = True
-        self._thread.start()
+        try:
+            self._thread.start()
+        except Exception:
+            self._running = False
+            self.state = STATE_IDLE
+            if self._audio is not None:
+                try:
+                    self._audio.stop()
+                except Exception:
+                    pass
+                self._audio = None
+            if self.effective_fmt == "MP4":
+                self._close_segment()
+            elif self.writer is not None:
+                try:
+                    self.writer.close()
+                except Exception:
+                    pass
+                self.writer = None
+            self._cleanup_segments()
+            self._remove_file(self._audio_path)
+            self._remove_file(self._video_path)
+            raise
 
     def pause(self):
         if self.state == STATE_RECORDING:
             self._paused_at = time.time()
+            self._pause_ts = time.perf_counter()
+            if self._audio is not None:
+                self._audio.pause()
             self.state = STATE_PAUSED
+            if self.effective_fmt == "MP4":
+                self._close_segment()
 
     def resume(self):
         if self.state == STATE_PAUSED:
+            if self.effective_fmt == "MP4":
+                try:
+                    self._open_segment()
+                except Exception as e:
+                    self.error = "继续录制失败：%s" % e
+                    self._running = False
+                    self.state = STATE_IDLE
+                    if self._audio is not None:
+                        try:
+                            self._audio.stop()
+                        except Exception:
+                            pass
+                    return
             self._paused_total += time.time() - self._paused_at
             self._paused_at = 0.0
+            if self._pause_ts:
+                if self._video_started_at:
+                    self._paused_after_first += max(
+                        0.0, time.perf_counter() - self._pause_ts)
+                self._pause_ts = 0.0
             self.state = STATE_RECORDING
+            if self._audio is not None:
+                self._audio.resume()
+
+    def _real_duration(self):
+        """从首帧到停止的真实有效时长（不含暂停）。"""
+        if not self._video_started_at:
+            return 0.0
+        end = self._stop_ts or time.perf_counter()
+        paused = self._paused_after_first
+        if self._pause_ts:
+            paused += max(0.0, end - self._pause_ts)
+        return max(0.0, end - self._video_started_at - paused)
+
+    @staticmethod
+    def _report(progress, frac, msg):
+        if progress:
+            try:
+                progress(max(0.0, min(1.0, frac)), msg)
+            except Exception:
+                pass
 
     def stop(self):
+        """同步停止并完成封装（退出程序 / 测试用）。"""
         if not self.is_active:
             return None
+        self._stop_ts = time.perf_counter()
         self._running = False
         self.state = STATE_IDLE
+        return self._finalize_stop(None)
+
+    def stop_async(self, done, progress=None):
+        """立即停止采集，把拼接 / 合并放到后台线程。
+
+        ``done(info, error)`` 在后台线程结束时调用，调用方需要用队列或
+        ``after`` 切回主线程更新界面。返回是否成功启动。
+        """
+        if not self.is_active:
+            return False
+        self._stop_ts = time.perf_counter()
+        self._running = False
+        self.state = STATE_IDLE
+
+        def run():
+            info = None
+            try:
+                info = self._finalize_stop(progress)
+            except Exception as e:
+                self.error = str(e)
+            try:
+                done(info, self.error)
+            except Exception:
+                pass
+
+        thread = threading.Thread(target=run, name="recorder-finalize",
+                                  daemon=True)
+        thread.start()
+        return True
+
+    def _finalize_stop(self, progress=None):
+        self._report(progress, 0.01, "正在停止采集…")
+        audio = self._audio
+        if audio is not None:
+            try:
+                audio.stop()
+            except Exception as e:
+                self.audio_error = self.audio_error or ("停止系统声音失败：%s" % e)
         if self._thread:
             self._thread.join(timeout=8.0)
         self._thread = None
+        if audio is not None and audio.error:
+            self.audio_error = self.audio_error or audio.error
+        self._report(progress, 0.05, "正在收尾视频…")
         info = None
         err = ""
-        duration = self.video_duration()
+        real_duration = self._real_duration()
+        if real_duration <= 0:
+            real_duration = self.video_duration()
+        final_path = ""
+        audio_included = False
         try:
-            if self.writer:
-                if self.effective_fmt == "GIF":
-                    duration = float(self.writer.frames) / float(
-                        max(1, self.writer.fps))
-                final_path = self.writer.close()
-                info = self._build_info(final_path, duration)
+            if self.writer or (self.effective_fmt == "MP4" and self._segments):
+                audio_ok = (audio is not None and audio.frames > 0
+                            and os.path.isfile(self._audio_path)
+                            and not audio.thread_alive)
+                lead = 0.0
+                video_start = self._first_video_ts or self._video_started_at
+                if audio_ok and audio.started_at and video_start:
+                    lead = max(0.0, video_start - audio.started_at)
+                    lead = min(lead, max(0.0, audio.duration - 0.05))
+                if audio is not None and audio.thread_alive:
+                    self.audio_error = self.audio_error or (
+                        "系统声音采集未能及时停止，本次仅保存视频")
+
+                if self.effective_fmt == "MP4":
+                    self._close_segment()
+                    self._report(progress, 0.12, "正在收尾视频分段…")
+                    segments = list(self._segments)
+                    if not segments:
+                        raise RuntimeError("没有可用的视频段")
+                    if len(segments) == 1:
+                        video_path = segments[0]
+                        self._report(progress, 0.45, "正在封装视频…")
+                    else:
+                        def _concat_progress(frac):
+                            self._report(progress, 0.12 + 0.33 * frac,
+                                         "正在拼接视频分段…")
+
+                        try:
+                            video_path = self._concat_segments(
+                                segments, self._video_path,
+                                duration=real_duration,
+                                progress=_concat_progress)
+                        except Exception as e:
+                            # 拼接失败时至少保留最大的一段，避免整段丢失。
+                            self.error = "视频分段拼接失败：%s" % e
+                            video_path = max(segments,
+                                             key=lambda p: os.path.getsize(p)
+                                             if os.path.isfile(p) else 0)
+                    if audio_ok:
+                        def _mux_progress(frac):
+                            self._report(progress, 0.45 + 0.47 * frac,
+                                         "正在合并音轨…")
+
+                        try:
+                            mux_audio(video_path, self._audio_path,
+                                      self.path, "MP4", lead,
+                                      real_duration, progress=_mux_progress)
+                            audio_included = True
+                            final_path = self.path
+                            self._remove_file(video_path)
+                        except Exception as e:
+                            self.audio_error = "系统声音合并失败：%s" % e
+                            final_path = self._finish_video(video_path)
+                    else:
+                        final_path = self._finish_video(video_path)
+                        self._report(progress, 0.92, "正在保存视频…")
+                elif self.effective_fmt == "GIF":
+                    self._report(progress, 0.30, "正在生成 GIF…")
+                    final_path = self.writer.close(
+                        duration=real_duration) or self._video_path
+                    self._report(progress, 0.90, "正在保存 GIF…")
+                elif self.effective_fmt == "AVI":
+                    self._report(progress, 0.25, "正在收尾视频…")
+                    final_fps = None
+                    if real_duration > 0 and self.writer.frames:
+                        final_fps = self.writer.frames / real_duration
+                    video_path = self.writer.close(
+                        final_fps=final_fps) or self._video_path
+                    if audio_ok:
+                        def _mux_avi(frac):
+                            self._report(progress, 0.45 + 0.47 * frac,
+                                         "正在合并音轨…")
+
+                        try:
+                            mux_audio(video_path, self._audio_path,
+                                      self.path, "AVI", lead,
+                                      duration=real_duration,
+                                      progress=_mux_avi)
+                            audio_included = True
+                            final_path = self.path
+                            self._remove_file(video_path)
+                        except Exception as e:
+                            self.audio_error = "系统声音合并失败：%s" % e
+                            final_path = self._finish_video(video_path)
+                    else:
+                        final_path = self._finish_video(video_path)
+                        self._report(progress, 0.90, "正在保存视频…")
+
+                if (audio is not None and not self.audio_error
+                        and audio.frames <= 0):
+                    self.audio_error = "没有采集到系统声音"
+                info = self._build_info(final_path, real_duration)
+                # 记录几项时间轴诊断信息，便于排查音画不同步（界面不显示）。
+                nominal = self.video_duration()
+                info["video_frames"] = int(self.frame_count)
+                info["video_real"] = round(real_duration, 3)
+                info["video_nominal"] = round(nominal, 3)
+                info["video_scale"] = (round(real_duration / nominal, 4)
+                                       if nominal > 0 else 1.0)
+                if audio is not None:
+                    info["audio_rate"] = int(audio.rate)
+                    info["audio_frames"] = int(audio.frames)
+                    info["audio_duration"] = round(audio.duration, 3)
+                    info["audio_lead"] = round(lead, 3)
+                if audio_included:
+                    info["audio"] = True
+                if self.audio_error:
+                    info["audio_error"] = self.audio_error
+                self._report(progress, 0.98, "正在写入录屏记录…")
         except Exception as e:
             err = str(e)
         finally:
@@ -873,8 +1347,112 @@ class Recorder(object):
             if self._grabber:
                 self._grabber.close()
                 self._grabber = None
-        self.error = err
+            if audio is not None:
+                try:
+                    audio.stop()
+                except Exception:
+                    pass
+            self._audio = None
+            self.audio_active = False
+            self._cleanup_segments()
+            # 清掉没有被采用的临时文件；最终文件本身不能删。
+            for p in (self._audio_path, self._video_path):
+                if p and os.path.abspath(p) != os.path.abspath(final_path):
+                    self._remove_file(p)
+            self._audio_path = ""
+            self._video_path = ""
+        self.error = err or self.error
         return info
+
+    @staticmethod
+    def _remove_file(path):
+        try:
+            if path and os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def _finish_video(self, video_path):
+        """把临时视频文件落到最终路径；改名失败时退回复制。"""
+        if not video_path:
+            return self.path
+        if os.path.abspath(video_path) == os.path.abspath(self.path):
+            return self.path
+        self._remove_file(self.path)
+        try:
+            os.replace(video_path, self.path)
+            return self.path
+        except OSError:
+            try:
+                shutil.copyfile(video_path, self.path)
+                self._remove_file(video_path)
+                return self.path
+            except OSError:
+                return video_path
+
+    # -- MP4 VFR 分段 -------------------------------------------------
+    def _open_segment(self):
+        path = os.path.join(self._segment_dir,
+                            "seg_%04d.mp4" % self._segment_index)
+        self._segment_index += 1
+        self.writer = FfmpegWriter(path, self.out_size[0], self.out_size[1],
+                                   self.fps)
+        return self.writer
+
+    def _close_segment(self):
+        """停止向当前段写帧并收尾；没有帧的段直接丢弃。"""
+        with self._writer_lock:
+            writer = self.writer
+            self.writer = None
+        if writer is None:
+            return None
+        path = writer.path
+        try:
+            if writer.frames <= 0:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                self._remove_file(path)
+                return None
+            closed = writer.close() or path
+            self._segments.append(closed)
+            return closed
+        except Exception as e:
+            self.error = self.error or ("视频分段收尾失败：%s" % e)
+            self._remove_file(path)
+            return None
+
+    def _concat_segments(self, segments, out_path, duration=None,
+                         progress=None):
+        if not segments:
+            raise RuntimeError("没有可用的视频段")
+        if len(segments) == 1:
+            return segments[0]
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            raise RuntimeError("未找到 ffmpeg，无法拼接分段")
+        list_path = os.path.join(self._segment_dir, "concat.txt")
+        with open(list_path, "w", encoding="utf-8") as f:
+            for p in segments:
+                q = os.path.abspath(p).replace("\\", "/").replace("'", "'\\''")
+                f.write("file '%s'\n" % q)
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+               "-f", "concat", "-safe", "0", "-i", list_path,
+               "-c", "copy", "-movflags", "+faststart", out_path]
+        code, err = _run_ffmpeg(cmd, duration, progress)
+        if (code != 0 or not os.path.isfile(out_path)
+                or os.path.getsize(out_path) < 1024):
+            raise RuntimeError("视频分段拼接失败：%s" %
+                               (err or "ffmpeg 未输出文件"))
+        return out_path
+
+    def _cleanup_segments(self):
+        self._segments = []
+        path = self._segment_dir
+        self._segment_dir = ""
+        if path:
+            shutil.rmtree(path, ignore_errors=True)
 
     # -- 采集线程 ----------------------------------------------------
     def _loop(self):
@@ -884,16 +1462,36 @@ class Recorder(object):
         out_w, out_h = self.out_size
         try:
             self._grabber = make_grabber()
+            first_frame = True
             while self._running:
                 if self.state == STATE_PAUSED:
                     time.sleep(0.03)
                     next_t = time.perf_counter()
                     continue
-                img = self._grabber.grab(x, y, w, h, cursor=self.capture_cursor)
+                exclude = None
+                if callable(self.exclude_provider):
+                    try:
+                        exclude = self.exclude_provider()
+                    except Exception:
+                        exclude = None
+                img = self._grabber.grab(x, y, w, h,
+                                         cursor=self.capture_cursor,
+                                         exclude=exclude)
                 if img.size != (out_w, out_h):
                     img = img.resize((out_w, out_h), Image.BILINEAR)
-                self.writer.add_image(img)
-                self.frame_count += 1
+                with self._writer_lock:
+                    writer = self.writer
+                    if writer is not None:
+                        writer.add_image(img)
+                        if first_frame:
+                            # 以第一帧写入编码器的时间作为音频对齐基准。
+                            self._video_started_at = (
+                                getattr(writer, "first_frame_ts", 0.0)
+                                or time.perf_counter())
+                            first_frame = False
+                        if not self._first_video_ts:
+                            self._first_video_ts = self._video_started_at
+                        self.frame_count += 1
                 next_t += interval
                 delay = next_t - time.perf_counter()
                 if delay > 0:
